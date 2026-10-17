@@ -1,0 +1,13 @@
+[[plugin]]
+id = "0x2u/ompclaude"
+name = "omp Claude Usage"
+version = "1.0.0"
+updated_at = 1792260000
+added_at = 1792260000
+author = "0x2u"
+license = "MIT"
+icon = "robot"
+description = "Claude usage of your omp session: 5-hour and weekly rate limits, token burn, cost, daily activity and per-model breakdown."
+deprecated = false
+plugin_api = 26
+tags = ["ai", "development", "indicator", "system", "bar", "desktop", "panel", "service"]

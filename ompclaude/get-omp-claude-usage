@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# omp Claude Usage — data engine. Prints one JSON object (--json is accepted and implied).
+#
+#   rate windows  GET api.anthropic.com/api/oauth/usage, authorized with the Anthropic
+#                 OAuth access token omp keeps in ~/.omp/agent/agent.db (read-only: omp
+#                 owns refreshing it — the token endpoint rotates the refresh token, so
+#                 spending it here would leave omp holding a dead one). An expired token
+#                 is not used; the last cached response is served until omp renews it.
+#   plan          GET /api/oauth/profile, cached 24 h (omp does not store the plan).
+#   tokens/cost   omp's own session logs (~/.omp/agent/sessions/**/*.jsonl): every Anthropic
+#                 assistant message carries its usage and its priced cost in USD. Other
+#                 providers are skipped so the figures match the rate windows above.
+#   usd->eur      Frankfurter (ECB), cached 24 h; only used for the EUR currency setting.
+set -eu
+
+AGENT_DIR="${OMP_AGENT_DIR:-${HOME}/.omp/agent}"
+OMP_DB="${AGENT_DIR}/agent.db"
+SESSIONS_DIR="${AGENT_DIR}/sessions"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/omp-claude-usage"
+USAGE_CACHE="${CACHE_DIR}/usage.json"
+PROFILE_CACHE="${CACHE_DIR}/profile.json"
+FX_CACHE="${CACHE_DIR}/usd-eur.json"
+USAGE_CACHE_TTL=120        # seconds
+DAILY_CACHE_TTL=86400
+TOKEN_EXPIRY_SKEW=60
+USER_AGENT="omp-claude-usage/1.0"
+
+mkdir -p "$CACHE_DIR"
+
+TODAY=$(date +%Y-%m-%d)
+DOW=$(date +%u)                                        # 1 = Monday
+WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
+MONTH_START=$(date +%Y-%m-01)
+DAYS_JSON=$(for i in 0 1 2 3 4 5 6; do date -d "$WEEK_START + ${i} days" +%Y-%m-%d; done | jq -R . | jq -sc .)
+
+now() { date +%s; }
+
+# Age of a cache file's .cached_at in seconds (a huge number when missing).
+cache_age() {
+    local ts
+    ts=$(jq -r '.cached_at // 0' "$1" 2>/dev/null || echo 0)
+    echo $(( $(now) - ts ))
+}
+
+# --- omp's Anthropic credential: "<access_token><TAB><expires_ms>" -----------------
+omp_credential() {
+    [ -r "$OMP_DB" ] || return 1
+    sqlite3 -readonly -cmd '.timeout 2000' -separator $'\t' "$OMP_DB" \
+        "SELECT json_extract(data,'\$.access'), json_extract(data,'\$.expires')
+         FROM auth_credentials
+         WHERE provider='anthropic' AND credential_type='oauth' AND disabled_cause IS NULL
+         ORDER BY updated_at DESC, id DESC LIMIT 1" 2>/dev/null
+}
+
+api_get() { # <token> <path>
+    curl -s --max-time 6 \
+        -H "Authorization: Bearer $1" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: ${USER_AGENT}" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com$2" 2>/dev/null || echo '{}'
+}
+
+TOKEN=""; EXPIRES=0
+if row=$(omp_credential) && [ -n "$row" ]; then
+    IFS=$'\t' read -r TOKEN EXPIRES <<< "$row"
+    case "$EXPIRES" in ''|*[!0-9]*) EXPIRES=0 ;; esac
+    # Expired: leave TOKEN empty so only cached data is served.
+    [ $(( EXPIRES / 1000 - TOKEN_EXPIRY_SKEW )) -gt "$(now)" ] || TOKEN=""
+fi
+
+# --- rate windows ----------------------------------------------------------------
+API_RESP='{}'
+if [ -f "$USAGE_CACHE" ] && [ "$(cache_age "$USAGE_CACHE")" -lt "$USAGE_CACHE_TTL" ]; then
+    API_RESP=$(jq -c '.data // {}' "$USAGE_CACHE" 2>/dev/null || echo '{}')
+else
+    if [ -n "$TOKEN" ]; then
+        API_RESP=$(api_get "$TOKEN" /api/oauth/usage)
+    fi
+    if echo "$API_RESP" | jq -e '.five_hour' >/dev/null 2>&1; then
+        jq -n --argjson data "$API_RESP" '{cached_at: (now | floor), data: $data}' > "$USAGE_CACHE" 2>/dev/null || true
+    elif [ -f "$USAGE_CACHE" ]; then
+        API_RESP=$(jq -c '.data // {}' "$USAGE_CACHE" 2>/dev/null || echo '{}')
+    else
+        API_RESP='{}'
+    fi
+fi
+
+# --- plan ------------------------------------------------------------------------
+if [ -n "$TOKEN" ] && { [ ! -f "$PROFILE_CACHE" ] || [ "$(cache_age "$PROFILE_CACHE")" -ge "$DAILY_CACHE_TTL" ]; }; then
+    resp=$(api_get "$TOKEN" /api/oauth/profile)
+    sub=$(echo "$resp" | jq -r '(.organization.organization_type // "") | sub("^claude_"; "")' 2>/dev/null || echo "")
+    tier=$(echo "$resp" | jq -r '.organization.rate_limit_tier // ""' 2>/dev/null || echo "")
+    if [ -n "$sub" ] && [ -n "$tier" ]; then
+        jq -n --arg s "$sub" --arg t "$tier" '{cached_at: (now | floor), sub: $s, tier: $t}' > "$PROFILE_CACHE" 2>/dev/null || true
+    fi
+fi
+SUBSCRIPTION=unknown; TIER=unknown
+if [ -f "$PROFILE_CACHE" ]; then
+    SUBSCRIPTION=$(jq -r '.sub // "unknown"' "$PROFILE_CACHE" 2>/dev/null || echo unknown)
+    TIER=$(jq -r '.tier // "unknown"' "$PROFILE_CACHE" 2>/dev/null || echo unknown)
+fi
+
+# --- USD -> EUR ------------------------------------------------------------------
+if [ ! -f "$FX_CACHE" ] || [ "$(cache_age "$FX_CACHE")" -ge "$DAILY_CACHE_TTL" ]; then
+    rate=$(curl -s --max-time 5 "https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR" 2>/dev/null \
+        | jq -r '.rates.EUR // empty' 2>/dev/null || echo "")
+    if [ -n "$rate" ]; then
+        jq -n --argjson r "$rate" '{cached_at: (now | floor), rate: $r}' > "$FX_CACHE" 2>/dev/null || true
+    fi
+fi
+USD_EUR_RATE=0
+[ -f "$FX_CACHE" ] && USD_EUR_RATE=$(jq -r '.rate // 0' "$FX_CACHE" 2>/dev/null || echo 0)
+
+# --- tokens + cost from omp's session logs -----------------------------------------
+# One row per Anthropic assistant message. Forked sessions replay their parent's history
+# with the same entry id + timestamp, so rows are de-duplicated on that pair.
+ROWS='[]'
+if [ -d "$SESSIONS_DIR" ]; then
+    ROWS=$(find "$SESSIONS_DIR" -name '*.jsonl' -print0 2>/dev/null \
+        | xargs -0 -r jq -R -c '
+            fromjson?
+            | select(.type == "message" and .message.role == "assistant"
+                     and .message.provider == "anthropic"
+                     and (.message.usage | type) == "object")
+            | { k: "\(.id)\(.timestamp)", s: input_filename, t: .timestamp,
+                m: (.message.model // "unknown"), u: .message.usage }' 2>/dev/null \
+        | jq -s -c 'unique_by(.k)' 2>/dev/null || echo '[]')
+fi
+
+echo "$ROWS" | jq \
+    --arg ws "$WEEK_START" --arg ms "$MONTH_START" --arg today "$TODAY" \
+    --argjson dates "$DAYS_JSON" \
+    --argjson api "$API_RESP" \
+    --arg sub "$SUBSCRIPTION" --arg tier "$TIER" --arg rate "$USD_EUR_RATE" '
+    def r2: . * 100 | round / 100;
+    def tok: (.input // 0) + (.output // 0) + (.cacheRead // 0) + (.cacheWrite // 0);
+    def family: if test("^claude-[a-z]+-") then split("-")[1] else . end;
+
+    map(. + {
+        d: (.t[:19] + "Z" | fromdateiso8601 | strflocaltime("%Y-%m-%d")),
+        tok: (.u | tok),
+        cost: (.u.cost.total // 0),
+        fam: (.m | family)
+    }) as $r
+    | ($r | map(select(.d >= $ws))) as $week
+    | ($r | map(select(.d >= $ms))) as $month
+    | ($dates | map(. as $d | $r | map(select(.d == $d))) ) as $byday
+    | {
+        name: "omp",
+        subscription: $sub, tier: $tier,
+        five_hour_util: ($api.five_hour.utilization // 0),
+        five_hour_reset: ($api.five_hour.resets_at // ""),
+        seven_day_util: ($api.seven_day.utilization // 0),
+        seven_day_reset: ($api.seven_day.resets_at // ""),
+        extra_usage: ($api.extra_usage.is_enabled // false),
+        limits: [ ($api.limits // [])[] | {
+            kind: (.kind // ""), group: (.group // ""),
+            model: (.scope.model.display_name // ""),
+            percent: (.percent // 0), resets_at: (.resets_at // ""),
+            severity: (.severity // "normal"), is_active: (.is_active // false) } ],
+        week_tokens: ($week | map(.tok) | add // 0),
+        month_tokens: ($month | map(.tok) | add // 0),
+        week_messages: ($week | length),
+        week_sessions: ($week | map(.s) | unique | length),
+        today_cost: ($r | map(select(.d == $today) | .cost) | add // 0 | r2),
+        week_cost: ($week | map(.cost) | add // 0 | r2),
+        month_cost: ($month | map(.cost) | add // 0 | r2),
+        daily: ($byday | map(map(.tok) | add // 0)),
+        daily_costs: ($byday | map(map(.cost) | add // 0 | r2)),
+        week_models: ($week | group_by(.fam) | map({ (.[0].fam): (map(.tok) | add) }) | add // {})
+      } as $p
+    | {
+        subscription_type: $p.subscription, rate_limit_tier: $p.tier,
+        five_hour_util: $p.five_hour_util, five_hour_reset: $p.five_hour_reset,
+        seven_day_util: $p.seven_day_util, seven_day_reset: $p.seven_day_reset,
+        extra_usage_enabled: $p.extra_usage,
+        limits: $p.limits,
+        week_messages: $p.week_messages, week_sessions: $p.week_sessions,
+        week_tokens: $p.week_tokens, month_tokens: $p.month_tokens,
+        week_models: $p.week_models,
+        alltime_sessions: ($r | map(.s) | unique | length),
+        alltime_messages: ($r | length),
+        first_session: ($r | map(.d) | min // "unknown"),
+        daily: $p.daily, daily_costs: $p.daily_costs,
+        today_cost: $p.today_cost, week_cost: $p.week_cost, month_cost: $p.month_cost,
+        usd_eur_rate: ($rate | tonumber? // 0),
+        profiles: ["omp"],
+        profile_data: [$p]
+      }'
